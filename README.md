@@ -45,9 +45,15 @@ Ou lancer une seule source :
 ```bash
 uv run python scripts/extract_newsdata.py --limit 10 --max-pages 1
 uv run python scripts/extract_politifact.py --limit 20
-uv run python scripts/extract_fakeddit.py --limit 100
+uv run python scripts/extract_fakeddit.py --limit 20
 uv run python scripts/extract_theconversation.py --limit 10
 ```
+
+Fakeddit conserve la prochaine ligne à lire dans
+`data/state/fakeddit_cursor.json`. Le curseur n'avance qu'après l'écriture
+réussie du lot JSON : deux exécutions successives traitent donc deux segments
+distincts du TSV. L'option `--reset-cursor` permet uniquement de repartir
+volontairement de la première ligne de données.
 
 L’extracteur The Conversation suit uniquement les URLs du flux Atom, vérifie le
 domaine, attend une seconde entre les articles et conserve la mention de licence
@@ -76,11 +82,13 @@ data/
 │   ├── politifact/extraction_<date>.json
 │   ├── fakeddit/extraction_<date>.json
 │   └── theconversation/extraction_<date>.json
-└── images/
+├── images/
     ├── newsdata/
     ├── politifact/
     ├── fakeddit/
     └── theconversation/
+└── state/
+    └── fakeddit_cursor.json
 
 logs/
 ├── newsdata.log
@@ -98,24 +106,23 @@ vérifier l’URL et le hash avant toute réutilisation.
 
 ## Transformation
 
-Après l’extraction, lancer le pipeline reproductible :
+En exécution manuelle, fournir explicitement les lots JSON du run à traiter :
 
 ```bash
-uv run python scripts/transform_data.py
-```
-
-Par défaut, le script cumule tous les lots et garde l’occurrence la plus récente
-de chaque publication. Une publication sans preuve complète reliant son URL à
-son image locale est rejetée. Les choix de lecture et de dédoublonnage sont
-configurables :
-
-```bash
-uv run python scripts/transform_data.py --sources politifact fakeddit
-uv run python scripts/transform_data.py --sources theconversation
 uv run python scripts/transform_data.py \
-  --input-mode latest \
-  --duplicate-policy keep-first
+  --input-files \
+    data/raw/newsdata/extraction_<date>.json \
+    data/raw/politifact/extraction_<date>.json \
+    data/raw/fakeddit/extraction_<date>.json \
+    data/raw/theconversation/extraction_<date>.json
 ```
+
+Le DAG Airflow transmet automatiquement à Transform les quatre chemins créés
+par ses tâches Extract via XCom. Le pipeline ne parcourt jamais `data/raw/` pour
+choisir ses entrées. La transformation exige exactement un lot courant pour
+chacune des quatre sources. Une publication sans preuve complète reliant son URL à
+son image locale est rejetée. `--duplicate-policy keep-first` permet, si besoin,
+de modifier la règle appliquée aux doublons présents dans le run courant.
 
 Le pipeline applique les étapes suivantes :
 
@@ -125,7 +132,7 @@ Le pipeline applique les étapes suivantes :
 4. mapping des quatre sources vers 18 colonnes communes ;
 5. validation du lien texte-image, de l’URL d’origine, du hash, de la signature
    et de la taille des fichiers ;
-6. dédoublonnage par identifiant ou couple URL-image ;
+6. dédoublonnage du run par identifiant ou couple URL-image ;
 7. typage, export et écriture des métriques d’audit.
 
 Sorties produites :
@@ -142,17 +149,21 @@ data/
 logs/transform.log
 ```
 
-Le manifeste conserve le chemin et le hash de chaque lot d’entrée, le hash du
-pipeline, tous les paramètres, les compteurs par lot, les motifs de rejet et les
-métriques de chaque étape. Le schéma conceptuel, le contrat Load, la clé primaire
-et le dictionnaire des champs sont documentés dans
+Le Parquet et le JSONL représentent le lot transformé du run courant. PostgreSQL
+conserve l’état cumulé grâce à un upsert sur `publication_id`. Le manifeste
+conserve le chemin et le hash exacts de chaque lot d’entrée, le hash du pipeline,
+les paramètres, les compteurs par lot, les motifs de rejet et les métriques de
+chaque étape. Le schéma conceptuel, le contrat Load, la clé primaire et le
+dictionnaire des champs sont documentés dans
 [`docs/E03_SCHEMA_DONNEES.ipynb`](docs/E03_SCHEMA_DONNEES.ipynb).
 
 ## Orchestration Airflow et chargement PostgreSQL
 
 Le DAG `checkitai_multimodal_etl` orchestre les quatre extractions en parallèle,
-puis la transformation, l'upsert PostgreSQL et un contrôle final. L'environnement
-local complet se lance ainsi :
+la transformation incrémentale de ces seuls lots, l'upsert PostgreSQL et un
+contrôle final. Tant que les services tournent, le scheduler lance un run toutes
+les 15 minutes (`*/15 * * * *`). Un déclenchement manuel reste possible depuis
+l'interface. L'environnement local complet se lance ainsi :
 
 ```bash
 uv run python scripts/init_airflow_env.py
@@ -180,6 +191,7 @@ fréquences de contrôle et consignes en cas d'incident sont documentés dans
 
 ## Documentation détaillée
 
+- [`GUIDE_PRESENTATION_PROJET_20_25_MIN.md`](docs/GUIDE_PRESENTATION_PROJET_20_25_MIN.md) — parcours visuel du cahier des charges pour l’échange avec le mentor
 - [`E01_RAPPORT_EXPLORATION_SOURCES.ipynb`](docs/E01_RAPPORT_EXPLORATION_SOURCES.ipynb) — [PDF](docs/E01_RAPPORT_EXPLORATION_SOURCES.pdf)
 - [`E03_SCHEMA_DONNEES.ipynb`](docs/E03_SCHEMA_DONNEES.ipynb) — [PDF](docs/E03_SCHEMA_DONNEES.pdf)
 - [`E04_FLUX_ETL_AIRFLOW.ipynb`](docs/E04_FLUX_ETL_AIRFLOW.ipynb) — [PDF](docs/E04_FLUX_ETL_AIRFLOW.pdf)
@@ -190,6 +202,7 @@ fréquences de contrôle et consignes en cas d'incident sont documentés dans
 - [`GUIDE_AIRFLOW_POSTGRES_LIGNE_PAR_LIGNE.html`](docs/perso/GUIDE_AIRFLOW_POSTGRES_LIGNE_PAR_LIGNE.html)
 - [`GUIDE_MONITORING_STREAMLIT_LIGNE_PAR_LIGNE.html`](docs/perso/GUIDE_MONITORING_STREAMLIT_LIGNE_PAR_LIGNE.html)
 - [`GUIDE_SESSION_BILAN_MENTOR.html`](docs/perso/GUIDE_SESSION_BILAN_MENTOR.html)
+- [`SCRIPT_ORAL_PRESENTATION_20_25_MIN.html`](docs/perso/SCRIPT_ORAL_PRESENTATION_20_25_MIN.html) — conducteur direct et chronométré pour l’échange avec Sylvain
 
 ## Choix des outils
 

@@ -10,7 +10,7 @@ from dotenv import dotenv_values
 
 from common import PROJECT_ROOT
 
-DEFAULT_OUTPUT = PROJECT_ROOT / ".env.airflow"
+AIRFLOW_ENV_PATH = PROJECT_ROOT / ".env.airflow"
 
 
 def generate_fernet_key() -> str:
@@ -38,14 +38,13 @@ def build_configuration(newsdata_api_key: str) -> dict[str, str]:
         "CHECKITAI_NEWSDATA_LIMIT": "10",
         "CHECKITAI_NEWSDATA_MAX_PAGES": "1",
         "CHECKITAI_POLITIFACT_LIMIT": "20",
-        "CHECKITAI_FAKEDDIT_LIMIT": "100",
+        "CHECKITAI_FAKEDDIT_LIMIT": "20",
         "CHECKITAI_THECONVERSATION_LIMIT": "10",
         "CHECKITAI_REQUEST_DELAY": "1.0",
-        "CHECKITAI_INPUT_MODE": "all",
         "CHECKITAI_DUPLICATE_POLICY": "keep-latest",
         "CHECKITAI_LOAD_BATCH_SIZE": "500",
         "CHECKITAI_TABLE": "publication_multimodale",
-        "CHECKITAI_SCHEDULE": "",
+        "CHECKITAI_SCHEDULE": "*/15 * * * *",
     }
 
 
@@ -64,25 +63,28 @@ def write_configuration(path: Path, values: dict[str, str]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    """Lit le chemin de sortie et l'option d'écrasement."""
+    """Lit l'option autorisant le remplacement du fichier existant."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Remplace le fichier .env.airflow s'il existe déjà.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     """Génère la configuration en réutilisant la clé NewsData locale si présente."""
     args = parse_args()
-    if args.output.exists() and not args.force:
+    if AIRFLOW_ENV_PATH.exists() and not args.force:
         raise SystemExit(
-            f"{args.output} existe déjà ; utilisez --force pour le remplacer."
+            f"{AIRFLOW_ENV_PATH} existe déjà ; utilisez --force pour le remplacer."
         )
 
     project_env = dotenv_values(PROJECT_ROOT / ".env")
     newsdata_api_key = str(project_env.get("NEWSDATA_API_KEY") or "")
-    write_configuration(args.output, build_configuration(newsdata_api_key))
-    print(f"Configuration créée : {args.output} (permissions 0600)")
+    write_configuration(AIRFLOW_ENV_PATH, build_configuration(newsdata_api_key))
+    print(f"Configuration créée : {AIRFLOW_ENV_PATH} (permissions 0600)")
     if not newsdata_api_key:
         print(
             "Ajoutez NEWSDATA_API_KEY dans ce fichier avant de lancer le DAG complet."

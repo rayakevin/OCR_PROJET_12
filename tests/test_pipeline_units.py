@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from collections import Counter
+from io import StringIO
 from pathlib import Path
 
 import pandas as pd
@@ -14,6 +15,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
+
+from extract_fakeddit import (
+    FIRST_DATA_LINE,
+    iter_tsv_rows,
+    read_fakeddit_cursor,
+    write_fakeddit_cursor,
+)
+from init_airflow_env import build_configuration
 
 from collect_kpis import (
     count_multimodal_publications,
@@ -31,6 +40,7 @@ from transform_data import (
     RecordValidationError,
     make_dataframe,
     normalize_datetime,
+    resolve_input_files,
     transform_batch,
     validate_configuration,
 )
@@ -71,10 +81,54 @@ class TransformationTests(unittest.TestCase):
         with self.assertRaises(RecordValidationError):
             normalize_datetime(None)
 
-    def test_validate_configuration_rejects_unknown_source(self) -> None:
+    def test_validate_configuration_rejects_unknown_policy(self) -> None:
         """Un appel programmatique ne peut pas contourner les choix de la CLI."""
-        with self.assertRaisesRegex(ValueError, "non prises en charge"):
-            validate_configuration(["inconnue"], "all", "keep-latest", "both")
+        with self.assertRaisesRegex(ValueError, "duplicate_policy"):
+            validate_configuration("inconnue", "both")
+
+    def test_resolve_input_files_requires_current_batch_for_each_source(self) -> None:
+        """Seuls les quatre lots explicitement fournis composent le run."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = []
+            for source in ("theconversation", "fakeddit", "newsdata", "politifact"):
+                path = root / f"{source}.json"
+                path.write_text(
+                    json.dumps({"source": source, "records": []}),
+                    encoding="utf-8",
+                )
+                paths.append(path)
+
+            selected = resolve_input_files(paths)
+
+        self.assertEqual(
+            [source for source, _ in selected],
+            ["newsdata", "politifact", "fakeddit", "theconversation"],
+        )
+
+    def test_resolve_input_files_rejects_incomplete_run(self) -> None:
+        """Un run incomplet ne peut pas alimenter le contrat consolidé."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "newsdata.json"
+            path.write_text(
+                json.dumps({"source": "newsdata", "records": []}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "exactement un lot courant"):
+                resolve_input_files([path])
+
+    def test_resolve_input_files_rejects_two_batches_for_one_source(self) -> None:
+        """Un run incrémental refuse un ensemble qui ne couvre pas quatre sources."""
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.json"
+            second = Path(directory) / "second.json"
+            payload = json.dumps({"source": "newsdata", "records": []})
+            first.write_text(payload, encoding="utf-8")
+            second.write_text(payload, encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "exactement un lot courant"):
+                resolve_input_files([first, second])
 
     def test_make_dataframe_keeps_exact_contract(self) -> None:
         """Le DataFrame respecte l'ordre des 18 colonnes."""
@@ -116,6 +170,43 @@ class TransformationTests(unittest.TestCase):
         self.assertEqual(audit["validation_rejected_count"], 1)
 
 
+class FakedditIncrementalTests(unittest.TestCase):
+    """Vérifie le curseur utilisé entre deux extractions Fakeddit."""
+
+    def test_cursor_defaults_then_persists_next_line(self) -> None:
+        """Un nouveau pipeline commence après l'en-tête puis garde son avance."""
+        with tempfile.TemporaryDirectory() as directory:
+            cursor_path = Path(directory) / "cursor.json"
+            self.assertEqual(read_fakeddit_cursor(cursor_path), FIRST_DATA_LINE)
+
+            write_fakeddit_cursor(42, cursor_path)
+
+            self.assertEqual(read_fakeddit_cursor(cursor_path), 42)
+
+    def test_tsv_iterator_skips_lines_before_cursor(self) -> None:
+        """Le second lot ne reparcourt pas les lignes du premier lot."""
+        file = StringIO("id\ttitle\nfirst\tA\nsecond\tB\nthird\tC\n")
+
+        rows = list(iter_tsv_rows(file, start_line=3))
+
+        self.assertEqual([line for line, _ in rows], [3, 4])
+        self.assertEqual([row["id"] for _, row in rows], ["second", "third"])
+
+
+class AirflowConfigurationTests(unittest.TestCase):
+    """Verrouille la cadence et les volumes attendus par le DAG local."""
+
+    def test_defaults_balance_sources_and_schedule_every_fifteen_minutes(self) -> None:
+        """La configuration générée garde des lots de 10 à 20 publications."""
+        configuration = build_configuration("test-key")
+
+        self.assertEqual(configuration["CHECKITAI_SCHEDULE"], "*/15 * * * *")
+        self.assertEqual(configuration["CHECKITAI_NEWSDATA_LIMIT"], "10")
+        self.assertEqual(configuration["CHECKITAI_POLITIFACT_LIMIT"], "20")
+        self.assertEqual(configuration["CHECKITAI_FAKEDDIT_LIMIT"], "20")
+        self.assertEqual(configuration["CHECKITAI_THECONVERSATION_LIMIT"], "10")
+
+
 class LoadTests(unittest.TestCase):
     """Vérifie les protections et la requête du chargement."""
 
@@ -140,19 +231,30 @@ class MonitoringTests(unittest.TestCase):
         """Les doublons ne sont pas additionnés aux rejets de validation."""
         counts = manifest_counts(
             {
+                "schema_version": "1.3",
+                "parameters": {"processing_mode": "incremental_exact_batches"},
                 "inputs": [
                     {
+                        "source": "newsdata",
                         "raw_count": 10,
                         "validated_count": 9,
                         "validation_rejected_count": 1,
                         "duplicate_discarded_count": 3,
-                    }
+                    },
+                    {"source": "politifact"},
+                    {"source": "fakeddit"},
+                    {"source": "theconversation"},
                 ]
             }
         )
         self.assertEqual(counts["raw_count"], 10)
         self.assertEqual(counts["validation_rejected_count"], 1)
         self.assertEqual(counts["duplicate_count"], 3)
+
+    def test_manifest_counts_rejects_another_processing_mode(self) -> None:
+        """Le dashboard refuse un manifeste produit par un autre workflow."""
+        with self.assertRaisesRegex(ValueError, "pipeline incrémental courant"):
+            manifest_counts({"parameters": {"processing_mode": "autre"}})
 
     def test_count_multimodal_requires_text_and_complete_image_proof(self) -> None:
         """Une URL d'image seule ne suffit pas à valider une publication."""

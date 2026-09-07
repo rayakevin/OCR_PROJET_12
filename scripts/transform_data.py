@@ -29,7 +29,7 @@ from common import (
 )
 
 SUPPORTED_SOURCES = ("newsdata", "politifact", "fakeddit", "theconversation")
-SCHEMA_VERSION = "1.2"
+SCHEMA_VERSION = "1.3"
 TRUSTED_IMAGE_PROVENANCE = {"downloaded", "metadata_verified"}
 
 FINAL_COLUMNS = (
@@ -464,21 +464,10 @@ TRANSFORMERS: dict[
 
 
 def validate_configuration(
-    sources: list[str] | tuple[str, ...],
-    input_mode: str,
     duplicate_policy: str,
     output_format: str,
 ) -> None:
     """Valide les options utilisées par la CLI comme par Airflow."""
-    if not sources:
-        raise ValueError("Au moins une source doit être sélectionnée.")
-    unknown_sources = sorted(set(sources) - set(SUPPORTED_SOURCES))
-    if unknown_sources:
-        raise ValueError(f"Sources non prises en charge : {', '.join(unknown_sources)}")
-    if len(set(sources)) != len(sources):
-        raise ValueError("Une source ne peut être sélectionnée qu'une fois.")
-    if input_mode not in {"latest", "all"}:
-        raise ValueError("input_mode doit valoir 'latest' ou 'all'.")
     if duplicate_policy not in {"keep-first", "keep-latest"}:
         raise ValueError("duplicate_policy doit valoir 'keep-first' ou 'keep-latest'.")
     if output_format not in {"parquet", "jsonl", "both"}:
@@ -738,7 +727,7 @@ def transform_inputs(
     duplicate_policy: str,
     logger: logging.Logger,
 ) -> tuple[list[dict], list[dict], list[dict], Counter]:
-    """Lit, mappe, valide puis déduplique tous les lots sélectionnés."""
+    """Lit, mappe, valide puis déduplique les lots explicitement fournis."""
     candidates: list[Candidate] = []
     rejected: list[dict] = []
     batch_audits: list[dict] = []
@@ -833,50 +822,67 @@ def project_path(path: Path) -> Path:
 
 
 def resolve_input_files(
-    sources: list[str] | tuple[str, ...],
-    input_mode: str,
-    raw_dir: Path,
+    input_paths: list[Path] | tuple[Path, ...],
 ) -> list[tuple[str, Path]]:
-    """Sélectionne le dernier lot ou tous les lots bruts de chaque source."""
-    raw_dir = project_path(raw_dir)
+    """Exige le lot courant de chacune des quatre sources du pipeline."""
+    if len(input_paths) != len(SUPPORTED_SOURCES):
+        raise ValueError(
+            "La transformation attend exactement un lot courant par source : "
+            + ", ".join(SUPPORTED_SOURCES)
+            + "."
+        )
+
     selected: list[tuple[str, Path]] = []
+    selected_sources: set[str] = set()
+    selected_paths: set[Path] = set()
 
-    for source in sources:
-        candidates = sorted((raw_dir / source).glob("extraction_*.json"))
-        if not candidates:
-            raise FileNotFoundError(f"Aucun lot brut trouvé pour {source}.")
-        paths = candidates if input_mode == "all" else [candidates[-1]]
+    for input_path in input_paths:
+        resolved_path = project_path(input_path)
+        if not resolved_path.is_file():
+            raise FileNotFoundError(f"Lot brut absent : {resolved_path}")
+        if resolved_path in selected_paths:
+            raise ValueError(f"Lot fourni plusieurs fois : {resolved_path}")
 
-        for path in paths:
-            resolved_path = path.resolve()
-            if not resolved_path.is_file():
-                raise FileNotFoundError(f"Lot brut absent : {resolved_path}")
-            selected.append((source, resolved_path))
+        try:
+            payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"Lot JSON illisible : {resolved_path}") from error
 
-    return selected
+        source = payload.get("source") if isinstance(payload, dict) else None
+        if source not in SUPPORTED_SOURCES:
+            raise ValueError(
+                f"Source non prise en charge dans {resolved_path} : {source!r}"
+            )
+        if source in selected_sources:
+            raise ValueError(f"Un seul lot incrémental est autorisé pour {source}.")
+
+        selected.append((source, resolved_path))
+        selected_sources.add(source)
+        selected_paths.add(resolved_path)
+
+    missing_sources = set(SUPPORTED_SOURCES) - selected_sources
+    if missing_sources:
+        raise ValueError(
+            "Lots manquants pour : " + ", ".join(sorted(missing_sources)) + "."
+        )
+
+    order = {source: index for index, source in enumerate(SUPPORTED_SOURCES)}
+    return sorted(selected, key=lambda item: order[item[0]])
 
 
 def run_transformation(
-    sources: list[str] | tuple[str, ...],
-    input_mode: str,
+    input_paths: list[Path] | tuple[Path, ...],
     duplicate_policy: str,
-    raw_dir: Path,
     processed_dir: Path,
     rejected_dir: Path,
     output_format: str,
     logger: logging.Logger,
 ) -> dict:
-    """Exécute le pipeline et retourne le manifeste écrit sur disque."""
-    validate_configuration(
-        sources,
-        input_mode,
-        duplicate_policy,
-        output_format,
-    )
-    input_files = resolve_input_files(sources, input_mode, raw_dir)
+    """Transforme uniquement les lots explicitement produits par le run courant."""
+    validate_configuration(duplicate_policy, output_format)
+    input_files = resolve_input_files(input_paths)
     logger.info(
-        "Configuration : input_mode=%s, duplicate_policy=%s",
-        input_mode,
+        "Configuration : mode=incrémental, duplicate_policy=%s",
         duplicate_policy,
     )
     for source, path in input_files:
@@ -913,11 +919,9 @@ def run_transformation(
         "pipeline_sha256": file_sha256(Path(__file__)),
         "transformed_at": utc_now(),
         "parameters": {
-            "sources": list(sources),
-            "input_mode": input_mode,
+            "processing_mode": "incremental_exact_batches",
             "duplicate_policy": duplicate_policy,
             "output_format": output_format,
-            "raw_dir": relative_path(project_path(raw_dir)),
             "processed_dir": relative_path(processed_dir),
             "rejected_dir": relative_path(rejected_dir),
         },
@@ -956,16 +960,11 @@ def parse_args() -> argparse.Namespace:
     """Lit les paramètres configurables du pipeline."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--sources",
+        "--input-files",
         nargs="+",
-        choices=SUPPORTED_SOURCES,
-        default=list(SUPPORTED_SOURCES),
-    )
-    parser.add_argument(
-        "--input-mode",
-        choices=("latest", "all"),
-        default="all",
-        help="Traite le dernier lot ou tout l'historique brut.",
+        type=Path,
+        required=True,
+        help="Quatre lots JSON exacts du run, un pour chacune des sources.",
     )
     parser.add_argument(
         "--duplicate-policy",
@@ -973,7 +972,6 @@ def parse_args() -> argparse.Namespace:
         default="keep-latest",
         help="Choisit l'occurrence conservée lorsqu'un doublon est détecté.",
     )
-    parser.add_argument("--raw-dir", type=Path, default=DATA_DIR / "raw")
     parser.add_argument("--processed-dir", type=Path, default=DATA_DIR / "processed")
     parser.add_argument("--rejected-dir", type=Path, default=DATA_DIR / "rejected")
     parser.add_argument(
@@ -991,10 +989,8 @@ def main() -> None:
 
     try:
         run_transformation(
-            sources=args.sources,
-            input_mode=args.input_mode,
+            input_paths=args.input_files,
             duplicate_policy=args.duplicate_policy,
-            raw_dir=args.raw_dir,
             processed_dir=args.processed_dir,
             rejected_dir=args.rejected_dir,
             output_format=args.output_format,

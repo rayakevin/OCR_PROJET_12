@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 
 from common import DATA_DIR, PROJECT_ROOT, write_json_atomic
+from transform_data import SCHEMA_VERSION, SUPPORTED_SOURCES
 
 DAG_ID = "checkitai_multimodal_etl"
 EXPECTED_TASKS = {
@@ -165,12 +166,25 @@ def read_publications(parquet_path: Path) -> pd.DataFrame:
 
 
 def manifest_counts(manifest: dict[str, Any]) -> dict[str, int]:
-    """Additionne les compteurs de qualité de tous les lots transformés."""
+    """Valide le manifeste incrémental puis additionne ses compteurs."""
+    parameters = manifest.get("parameters")
+    if not isinstance(parameters, dict) or parameters.get("processing_mode") != (
+        "incremental_exact_batches"
+    ):
+        raise ValueError("Le manifeste ne provient pas du pipeline incrémental courant.")
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"Version de schéma attendue : {SCHEMA_VERSION}.")
+
     inputs = manifest.get("inputs")
     if not isinstance(inputs, list) or not all(
         isinstance(item, dict) for item in inputs
     ):
         raise ValueError("Le manifeste ne contient pas une liste 'inputs' valide.")
+    input_sources = [item.get("source") for item in inputs]
+    if len(input_sources) != len(SUPPORTED_SOURCES) or set(input_sources) != set(
+        SUPPORTED_SOURCES
+    ):
+        raise ValueError("Le manifeste doit contenir un lot pour chaque source.")
 
     return {
         "raw_count": sum(int(item.get("raw_count", 0)) for item in inputs),
@@ -204,10 +218,12 @@ def collect_kpis(
     airflow_logs: Path = DEFAULT_AIRFLOW_LOGS,
     data_directory: Path = DATA_DIR,
 ) -> dict[str, Any]:
-    """Retourne les indicateurs de qualité, performance et stockage."""
+    """Retourne qualité du lot courant, performance et stockage cumulé."""
     manifest = read_json(manifest_path)
     dataframe = read_publications(parquet_path)
     counts = manifest_counts(manifest)
+    if int(manifest.get("accepted_count", -1)) != len(dataframe):
+        raise ValueError("Le Parquet ne correspond pas au manifeste du run courant.")
     multimodal_count = count_multimodal_publications(dataframe)
     runs = collect_airflow_runs(airflow_logs)
     successful_runs = sum(run["status"] == "success" for run in runs)

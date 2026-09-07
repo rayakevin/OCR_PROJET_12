@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,7 +50,8 @@ def configure_logging(source: str) -> logging.Logger:
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
     )
-    console_handler = logging.StreamHandler()
+    # stdout évite qu'Airflow classe les messages INFO comme des erreurs stderr.
+    console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     file_handler = logging.FileHandler(
         LOGS_DIR / f"{source}.log",

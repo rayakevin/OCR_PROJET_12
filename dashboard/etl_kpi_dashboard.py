@@ -129,7 +129,7 @@ st.set_page_config(
     layout="wide",
 )
 st.title("Suivi du pipeline de données multimodales")
-st.caption("Qualité des données, rapidité d'exécution et coût opérationnel estimé")
+st.caption("Qualité du lot courant, rapidité d'exécution et coût opérationnel estimé")
 
 try:
     kpis, config = load_dashboard_data()
@@ -181,13 +181,13 @@ overview_columns = st.columns(4)
 overview_columns[0].metric(
     "Données valides",
     f"{quality['validity_percent']:.1f} %",
-    help="Part des entrées ayant passé les contrôles de transformation.",
+    help="Part des entrées du lot courant ayant passé les contrôles.",
     border=True,
 )
 overview_columns[1].metric(
     "Texte + image complets",
     f"{quality['multimodal_percent']:.1f} %",
-    help="Part des publications finales possédant texte et preuve d'image.",
+    help="Part du lot courant possédant texte et preuve d'image.",
     border=True,
 )
 overview_columns[2].metric(
@@ -210,7 +210,7 @@ quality_tab, performance_tab, cost_tab, details_tab = st.tabs(
 with quality_tab:
     left, right = st.columns(2)
     with left:
-        st.subheader("Publications finales par source")
+        st.subheader("Publications du lot courant par source")
         source_frame = pd.DataFrame(kpis["sources"])
         st.bar_chart(
             source_frame,
@@ -220,7 +220,7 @@ with quality_tab:
             y_label="Nombre de publications",
         )
     with right:
-        st.subheader("Résultat du nettoyage")
+        st.subheader("Résultat du lot courant")
         cleaning_frame = pd.DataFrame(
             {
                 "Résultat": ["Conservées", "Doublons retirés", "Invalides"],
@@ -235,12 +235,12 @@ with quality_tab:
             cleaning_frame, x="Résultat", y="Nombre", y_label="Nombre d'entrées"
         )
     st.info(
-        f"{quality['duplicate_count']} occurrences répétées ont été retirées. "
+        f"{quality['duplicate_count']} occurrences répétées du run ont été retirées. "
         "Elles ne sont pas comptées comme invalides."
     )
 
 with performance_tab:
-    st.subheader("Historique des exécutions")
+    st.subheader("Historique des exécutions incrémentales")
     history = pd.DataFrame(
         [
             {

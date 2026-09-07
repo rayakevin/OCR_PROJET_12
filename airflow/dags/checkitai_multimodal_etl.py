@@ -10,6 +10,12 @@ from airflow.sdk import DAG
 
 DAG_ID = "checkitai_multimodal_etl"
 POSTGRES_CONN_ID = "checkitai_warehouse"
+EXTRACT_TASK_SOURCES = {
+    "extract_newsdata": "newsdata",
+    "extract_politifact": "politifact",
+    "extract_fakeddit": "fakeddit",
+    "extract_theconversation": "theconversation",
+}
 
 
 def project_root() -> Path:
@@ -34,12 +40,55 @@ def positive_int_env(name: str, default: int) -> int:
     return value
 
 
-def extract_newsdata_task() -> int:
+def save_extraction_result(records: list[dict], source: str) -> dict[str, object]:
+    """Sauvegarde un lot et retourne sa référence exacte pour la tâche suivante."""
+    import_project_scripts()
+    from common import relative_path, save_json_records
+
+    output_path = save_json_records(records, source)
+    return {
+        "source": source,
+        "path": relative_path(output_path),
+        "count": len(records),
+    }
+
+
+def current_run_input_paths(ti) -> list[Path]:
+    """Récupère dans XCom les quatre lots créés par le run Airflow courant."""
+    root = project_root()
+    task_ids = list(EXTRACT_TASK_SOURCES)
+    results = ti.xcom_pull(task_ids=task_ids)
+    if not isinstance(results, list) or len(results) != len(task_ids):
+        raise RuntimeError("Les références des lots d'extraction sont incomplètes.")
+
+    input_paths: list[Path] = []
+    raw_root = (root / "data/raw").resolve()
+    for task_id, result in zip(task_ids, results, strict=True):
+        expected_source = EXTRACT_TASK_SOURCES[task_id]
+        if not isinstance(result, dict) or result.get("source") != expected_source:
+            raise RuntimeError(f"XCom invalide pour {task_id} : {result!r}")
+
+        relative_batch_path = result.get("path")
+        if not isinstance(relative_batch_path, str):
+            raise RuntimeError(f"Chemin de lot absent dans le XCom de {task_id}.")
+        batch_path = (root / relative_batch_path).resolve()
+        try:
+            batch_path.relative_to(raw_root)
+        except ValueError as error:
+            raise RuntimeError(f"Lot hors de data/raw : {batch_path}") from error
+        if not batch_path.is_file():
+            raise FileNotFoundError(f"Lot du run courant absent : {batch_path}")
+        input_paths.append(batch_path)
+
+    return input_paths
+
+
+def extract_newsdata_task() -> dict[str, object]:
     """Extrait et sauvegarde un lot NewsData.io."""
     import_project_scripts()
     from extract_newsdata import extract_newsdata
 
-    from common import configure_logging, save_json_records
+    from common import configure_logging
 
     api_key = os.getenv("NEWSDATA_API_KEY")
     if not api_key:
@@ -53,16 +102,15 @@ def extract_newsdata_task() -> int:
         refresh_images=False,
         logger=logger,
     )
-    save_json_records(records, "newsdata")
-    return len(records)
+    return save_extraction_result(records, "newsdata")
 
 
-def extract_politifact_task() -> int:
+def extract_politifact_task() -> dict[str, object]:
     """Extrait et sauvegarde un lot PolitiFact."""
     import_project_scripts()
     from extract_politifact import extract_politifact
 
-    from common import configure_logging, save_json_records
+    from common import configure_logging
 
     logger = configure_logging("politifact")
     records = extract_politifact(
@@ -70,16 +118,19 @@ def extract_politifact_task() -> int:
         refresh_images=False,
         logger=logger,
     )
-    save_json_records(records, "politifact")
-    return len(records)
+    return save_extraction_result(records, "politifact")
 
 
-def extract_fakeddit_task() -> int:
+def extract_fakeddit_task() -> dict[str, object]:
     """Extrait et sauvegarde un lot Fakeddit depuis le TSV monté."""
     root = import_project_scripts()
-    from extract_fakeddit import extract_fakeddit
+    from extract_fakeddit import (
+        extract_fakeddit,
+        read_fakeddit_cursor,
+        write_fakeddit_cursor,
+    )
 
-    from common import configure_logging, save_json_records
+    from common import configure_logging
 
     logger = configure_logging("fakeddit")
     tsv_path = Path(
@@ -88,22 +139,27 @@ def extract_fakeddit_task() -> int:
             str(root / "data/external/fakeddit/multimodal_train.tsv"),
         )
     )
-    records = extract_fakeddit(
+    cursor_path = root / "data/state/fakeddit_cursor.json"
+    start_line = read_fakeddit_cursor(cursor_path)
+    records, next_line = extract_fakeddit(
         tsv_path=tsv_path,
-        limit=positive_int_env("CHECKITAI_FAKEDDIT_LIMIT", 100),
+        limit=positive_int_env("CHECKITAI_FAKEDDIT_LIMIT", 20),
+        start_line=start_line,
         refresh_images=False,
         logger=logger,
     )
-    save_json_records(records, "fakeddit")
-    return len(records)
+    result = save_extraction_result(records, "fakeddit")
+    write_fakeddit_cursor(next_line, cursor_path)
+    logger.info("Curseur Fakeddit avancé de la ligne %s à %s", start_line, next_line)
+    return result
 
 
-def extract_theconversation_task() -> int:
+def extract_theconversation_task() -> dict[str, object]:
     """Extrait et sauvegarde un lot The Conversation France."""
     import_project_scripts()
     from extract_theconversation import extract_theconversation
 
-    from common import configure_logging, save_json_records
+    from common import configure_logging
 
     logger = configure_logging("theconversation")
     request_delay = float(os.getenv("CHECKITAI_REQUEST_DELAY", "1.0"))
@@ -115,22 +171,19 @@ def extract_theconversation_task() -> int:
         refresh_images=False,
         logger=logger,
     )
-    save_json_records(records, "theconversation")
-    return len(records)
+    return save_extraction_result(records, "theconversation")
 
 
-def transform_task() -> int:
-    """Consolide tous les lots bruts dans le contrat Parquet final."""
+def transform_task(ti) -> int:
+    """Transforme uniquement les lots créés par le run Airflow courant."""
     root = import_project_scripts()
     from common import configure_logging
-    from transform_data import SUPPORTED_SOURCES, run_transformation
+    from transform_data import run_transformation
 
     logger = configure_logging("transform")
     manifest = run_transformation(
-        sources=SUPPORTED_SOURCES,
-        input_mode=os.getenv("CHECKITAI_INPUT_MODE", "all"),
+        input_paths=current_run_input_paths(ti),
         duplicate_policy=os.getenv("CHECKITAI_DUPLICATE_POLICY", "keep-latest"),
-        raw_dir=root / "data/raw",
         processed_dir=root / "data/processed",
         rejected_dir=root / "data/rejected",
         output_format="both",
@@ -185,7 +238,7 @@ def validate_postgres_task(ti) -> dict[str, int]:
 with DAG(
     dag_id=DAG_ID,
     description="Extraction, transformation et chargement des publications multimodales",
-    schedule=os.getenv("CHECKITAI_SCHEDULE") or None,
+    schedule=os.getenv("CHECKITAI_SCHEDULE") or "*/15 * * * *",
     start_date=datetime(2026, 1, 1, tzinfo=UTC),
     catchup=False,
     max_active_runs=1,
